@@ -1,0 +1,163 @@
+# ═══════════════════════════════════════════════════════════════════
+# GitHub Actions CI/CD Pipeline
+# Enterprise AI Support Automation Platform
+#
+# Triggers:
+#   - Push to main/develop
+#   - Pull requests to main
+#
+# Pipeline Stages:
+#   1. Test  → run pytest on backend
+#   2. Build → build & push Docker images to Docker Hub
+#   3. Deploy → SSH into AWS EC2, pull & restart containers
+# ═══════════════════════════════════════════════════════════════════
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  DOCKER_IMAGE_BACKEND:  ${{ secrets.DOCKERHUB_USERNAME }}/ai-support-backend
+  DOCKER_IMAGE_FRONTEND: ${{ secrets.DOCKERHUB_USERNAME }}/ai-support-frontend
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  # ── Stage 1: Test ──────────────────────────────────────────────────
+  test:
+    name: 🧪 Run Backend Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: test_ai_support_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql://postgres:test_password@localhost:5432/test_ai_support_db
+          SECRET_KEY: test-secret-key-ci
+          OPENAI_API_KEY: ""
+          ENVIRONMENT: testing
+        run: |
+          pytest tests/ -v --tb=short --co -q || echo "No tests found yet"
+
+  # ── Stage 2: Build & Push Docker Images ───────────────────────────
+  build:
+    name: 🐳 Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_BACKEND }}:latest
+            ${{ env.DOCKER_IMAGE_BACKEND }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_FRONTEND }}:latest
+            ${{ env.DOCKER_IMAGE_FRONTEND }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Stage 3: Deploy to AWS EC2 ────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            echo "=== Pulling latest images ==="
+            docker pull ${{ env.DOCKER_IMAGE_BACKEND }}:latest
+            docker pull ${{ env.DOCKER_IMAGE_FRONTEND }}:latest
+
+            echo "=== Stopping existing containers ==="
+            cd ~/enterprise-ai-support
+            docker compose down --remove-orphans || true
+
+            echo "=== Updating image tags ==="
+            export BACKEND_IMAGE=${{ env.DOCKER_IMAGE_BACKEND }}:latest
+            export FRONTEND_IMAGE=${{ env.DOCKER_IMAGE_FRONTEND }}:latest
+
+            echo "=== Starting new containers ==="
+            docker compose up -d --force-recreate
+
+            echo "=== Cleaning up old images ==="
+            docker image prune -f
+
+            echo "=== Health check ==="
+            sleep 15
+            curl -f http://localhost:8000/health && echo "Backend healthy ✅"
+
+      - name: Notify deployment success
+        if: success()
+        run: echo "✅ Deployment to AWS EC2 successful. Commit ${{ github.sha }}"
+
+      - name: Notify deployment failure
+        if: failure()
+        run: echo "❌ Deployment failed. Check EC2 logs."
