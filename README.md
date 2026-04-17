@@ -561,9 +561,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 ---
 
 <div align="center">
-
 **Built for EPAM Systems Digital Engineering Portfolio**
-
 ⭐ Star this repo if you found it useful · 🍴 Fork to build your own
-
 </div>
